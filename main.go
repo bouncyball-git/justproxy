@@ -18,13 +18,12 @@ import (
 const dialTimeout = 10 * time.Second
 
 type PortMapping struct {
-	Listen int `json:"listen"`
-	Dest   int `json:"dest,omitempty"`
+	Listen int    `json:"listen"`
+	Dest   string `json:"dest"`
 }
 
 type Config struct {
 	AllowedIPs []string      `json:"allowed_ips"`
-	DestIP     string        `json:"dest_ip"`
 	Ports      []PortMapping `json:"ports"`
 }
 
@@ -49,9 +48,6 @@ func main() {
 	if len(cfg.AllowedIPs) == 0 {
 		log.Fatal("no allowed_ips configured")
 	}
-	if cfg.DestIP == "" {
-		log.Fatal("no dest_ip configured")
-	}
 	if len(cfg.Ports) == 0 {
 		log.Fatal("no ports configured")
 	}
@@ -68,31 +64,27 @@ func main() {
 	// port conflicts are caught early and reported synchronously.
 	type listenerInfo struct {
 		ln       net.Listener
-		destPort int
+		destAddr string
 	}
 	listeners := make([]listenerInfo, 0, len(cfg.Ports))
 	for _, pm := range cfg.Ports {
-		destPort := pm.Dest
-		if destPort == 0 {
-			destPort = pm.Listen
-		}
+		destAddr := resolveDestAddr(pm.Dest, pm.Listen)
 		addr := fmt.Sprintf(":%d", pm.Listen)
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			log.Fatalf("listen %s: %v", addr, err)
 		}
-		destAddr := net.JoinHostPort(cfg.DestIP, fmt.Sprintf("%d", destPort))
 		log.Printf("listening on %s -> %s", addr, destAddr)
-		listeners = append(listeners, listenerInfo{ln: ln, destPort: destPort})
+		listeners = append(listeners, listenerInfo{ln: ln, destAddr: destAddr})
 	}
 
 	var wg sync.WaitGroup
 	for _, li := range listeners {
 		wg.Add(1)
-		go func(ln net.Listener, destPort int) {
+		go func(ln net.Listener, destAddr string) {
 			defer wg.Done()
-			serve(ctx, ln, cfg.DestIP, destPort, allowed)
-		}(li.ln, li.destPort)
+			serve(ctx, ln, destAddr, allowed)
+		}(li.ln, li.destAddr)
 	}
 
 	<-sigCh
@@ -135,7 +127,25 @@ func normalizeIP(s string) string {
 	return ip.String()
 }
 
-func serve(ctx context.Context, ln net.Listener, destIP string, destPort int, allowed map[string]bool) {
+// resolveDestAddr parses the dest field from config. If it contains
+// a port (ip:port), it's used as-is. If it's just an IP, the listen
+// port is used as the destination port.
+func resolveDestAddr(dest string, listenPort int) string {
+	host, port, err := net.SplitHostPort(dest)
+	if err != nil {
+		// No port specified — use listen port.
+		if net.ParseIP(dest) == nil {
+			log.Fatalf("invalid dest address: %q", dest)
+		}
+		return net.JoinHostPort(dest, fmt.Sprintf("%d", listenPort))
+	}
+	if net.ParseIP(host) == nil {
+		log.Fatalf("invalid dest IP: %q", host)
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func serve(ctx context.Context, ln net.Listener, destAddr string, allowed map[string]bool) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -145,11 +155,11 @@ func serve(ctx context.Context, ln net.Listener, destIP string, destPort int, al
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go handleConn(conn, destIP, destPort, allowed)
+		go handleConn(conn, destAddr, allowed)
 	}
 }
 
-func handleConn(src net.Conn, destIP string, destPort int, allowed map[string]bool) {
+func handleConn(src net.Conn, destAddr string, allowed map[string]bool) {
 	clientIP, _, err := net.SplitHostPort(src.RemoteAddr().String())
 	if err != nil {
 		src.Close()
@@ -162,7 +172,6 @@ func handleConn(src net.Conn, destIP string, destPort int, allowed map[string]bo
 		return
 	}
 
-	destAddr := net.JoinHostPort(destIP, fmt.Sprintf("%d", destPort))
 	dst, err := net.DialTimeout("tcp", destAddr, dialTimeout)
 	if err != nil {
 		log.Printf("dial %s: %v", destAddr, err)
