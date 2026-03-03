@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -8,8 +9,13 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 )
+
+const dialTimeout = 10 * time.Second
 
 type PortMapping struct {
 	Listen int `json:"listen"`
@@ -50,38 +56,93 @@ func main() {
 		log.Fatal("no ports configured")
 	}
 
-	allowed := make(map[string]bool, len(cfg.AllowedIPs))
-	for _, ip := range cfg.AllowedIPs {
-		allowed[ip] = true
-	}
+	allowed := parseAllowedIPs(cfg.AllowedIPs)
 
-	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Bind all listeners before accepting connections so that
+	// port conflicts are caught early and reported synchronously.
+	type listenerInfo struct {
+		ln       net.Listener
+		destPort int
+	}
+	listeners := make([]listenerInfo, 0, len(cfg.Ports))
 	for _, pm := range cfg.Ports {
 		destPort := pm.Dest
 		if destPort == 0 {
 			destPort = pm.Listen
 		}
+		addr := fmt.Sprintf(":%d", pm.Listen)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Fatalf("listen %s: %v", addr, err)
+		}
+		destAddr := net.JoinHostPort(cfg.DestIP, fmt.Sprintf("%d", destPort))
+		log.Printf("listening on %s -> %s", addr, destAddr)
+		listeners = append(listeners, listenerInfo{ln: ln, destPort: destPort})
+	}
+
+	var wg sync.WaitGroup
+	for _, li := range listeners {
 		wg.Add(1)
-		go func(listenPort, destPort int) {
+		go func(ln net.Listener, destPort int) {
 			defer wg.Done()
-			serve(listenPort, cfg.DestIP, destPort, allowed)
-		}(pm.Listen, destPort)
+			serve(ctx, ln, cfg.DestIP, destPort, allowed)
+		}(li.ln, li.destPort)
+	}
+
+	<-sigCh
+	log.Println("shutting down...")
+	cancel()
+	for _, li := range listeners {
+		li.ln.Close()
 	}
 	wg.Wait()
 }
 
-func serve(listenPort int, destIP string, destPort int, allowed map[string]bool) {
-	addr := fmt.Sprintf(":%d", listenPort)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("listen %s: %v", addr, err)
+// parseAllowedIPs normalizes IP addresses so that IPv4-mapped IPv6
+// addresses (e.g. ::ffff:192.168.1.100) match their IPv4 equivalents.
+func parseAllowedIPs(raw []string) map[string]bool {
+	allowed := make(map[string]bool, len(raw))
+	for _, s := range raw {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			log.Fatalf("invalid IP in allowed_ips: %q", s)
+		}
+		// Unmap IPv4-mapped IPv6 to canonical IPv4 form.
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		}
+		allowed[ip.String()] = true
 	}
-	log.Printf("listening on %s -> %s:%d", addr, destIP, destPort)
+	return allowed
+}
 
+// normalizeIP returns the canonical string form of an IP address,
+// unmapping IPv4-mapped IPv6 addresses.
+func normalizeIP(s string) string {
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return s
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.String()
+}
+
+func serve(ctx context.Context, ln net.Listener, destIP string, destPort int, allowed map[string]bool) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("accept on %s: %v", addr, err)
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("accept: %v", err)
 			continue
 		}
 		go handleConn(conn, destIP, destPort, allowed)
@@ -95,14 +156,14 @@ func handleConn(src net.Conn, destIP string, destPort int, allowed map[string]bo
 		return
 	}
 
-	if !allowed[clientIP] {
+	if !allowed[normalizeIP(clientIP)] {
 		log.Printf("rejected connection from %s", clientIP)
 		src.Close()
 		return
 	}
 
-	destAddr := fmt.Sprintf("%s:%d", destIP, destPort)
-	dst, err := net.Dial("tcp", destAddr)
+	destAddr := net.JoinHostPort(destIP, fmt.Sprintf("%d", destPort))
+	dst, err := net.DialTimeout("tcp", destAddr, dialTimeout)
 	if err != nil {
 		log.Printf("dial %s: %v", destAddr, err)
 		src.Close()
@@ -111,10 +172,26 @@ func handleConn(src net.Conn, destIP string, destPort int, allowed map[string]bo
 
 	log.Printf("proxying %s -> %s", src.RemoteAddr(), destAddr)
 
+	var wg sync.WaitGroup
+	wg.Add(2)
+
 	go func() {
+		defer wg.Done()
 		io.Copy(dst, src)
-		dst.Close()
+		if tc, ok := dst.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
 	}()
-	io.Copy(src, dst)
+
+	go func() {
+		defer wg.Done()
+		io.Copy(src, dst)
+		if tc, ok := src.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		}
+	}()
+
+	wg.Wait()
+	dst.Close()
 	src.Close()
 }
